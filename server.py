@@ -30,13 +30,16 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
 class ChatRequest(BaseModel):
     character: dict[str, Any]
     history: list[dict[str, Any]] = []
-    message: str
+    message: str = ""
+
 
 class GenerateCharacterRequest(BaseModel):
     idea: str = ""
+
 
 class GenerateImageRequest(BaseModel):
     prompt: str
@@ -45,9 +48,23 @@ class GenerateImageRequest(BaseModel):
     aspect_ratio: str = "1:1"
     image_size: str = "1K"
 
+
 class MemoryRequest(BaseModel):
     character: dict[str, Any]
     history: list[dict[str, Any]] = []
+
+
+class ContinueRequest(BaseModel):
+    character: dict[str, Any]
+    history: list[dict[str, Any]] = []
+
+
+class RegenerateRequest(BaseModel):
+    character: dict[str, Any]
+    history: list[dict[str, Any]] = []
+    message: str = ""
+    count: int = 3
+
 
 def safe_json(text: str) -> dict[str, Any]:
     value = text.strip()
@@ -58,8 +75,9 @@ def safe_json(text: str) -> dict[str, Any]:
     start = value.find("{")
     end = value.rfind("}")
     if start >= 0 and end > start:
-        value = value[start:end + 1]
+        value = value[start : end + 1]
     return json.loads(value)
+
 
 def character_system(c: dict[str, Any]) -> str:
     name = c.get("name", "Talkie")
@@ -93,11 +111,16 @@ Conversation rules:
 - Treat the user as the person interacting with the character, not as another AI.
 """
 
-def to_chat_messages(req: ChatRequest, last_user_message: str | None = None):
+
+def to_chat_messages(
+    c: dict[str, Any],
+    history: list[dict[str, Any]],
+    last_user_message: str | None = None,
+):
     result: list[dict[str, str]] = [
-        {"role": "system", "content": character_system(req.character)}
+        {"role": "system", "content": character_system(c)}
     ]
-    for m in req.history[-48:]:
+    for m in history[-48:]:
         role = "assistant" if m.get("role") == "assistant" else "user"
         text = str(m.get("text", "")).strip()
         if text:
@@ -106,6 +129,7 @@ def to_chat_messages(req: ChatRequest, last_user_message: str | None = None):
         if not result or result[-1].get("content") != last_user_message:
             result.append({"role": "user", "content": last_user_message})
     return result
+
 
 async def xai_chat(messages: list[dict[str, str]], n: int = 1) -> list[str]:
     if not GROK_API_KEY:
@@ -134,6 +158,7 @@ async def xai_chat(messages: list[dict[str, str]], n: int = 1) -> list[str]:
             if choice.get("message", {}).get("content")
         ]
 
+
 async def openai_chat(messages: list[dict[str, str]], n: int = 1) -> list[str]:
     if not OPENAI_API_KEY:
         raise RuntimeError("OPENAI_API_KEY is not configured")
@@ -161,7 +186,8 @@ async def openai_chat(messages: list[dict[str, str]], n: int = 1) -> list[str]:
             if choice.get("message", {}).get("content")
         ]
 
-@app.get("/health")
+
+@app.api_route("/health", methods=["GET", "POST"])
 async def health():
     return {
         "ok": True,
@@ -171,9 +197,10 @@ async def health():
         "gemini": bool(GEMINI_API_KEY),
     }
 
+
 @app.post("/chat")
 async def chat(req: ChatRequest):
-    messages = to_chat_messages(req, req.message)
+    messages = to_chat_messages(req.character, req.history, req.message)
     try:
         answers = await xai_chat(messages, 1)
         if answers:
@@ -194,8 +221,91 @@ async def chat(req: ChatRequest):
         )
     raise HTTPException(status_code=502, detail="No AI provider returned text.")
 
-# (El resto de endpoints generate_character, memory, continue, etc. idénticos al original)
+
+@app.post("/regenerate")
+async def regenerate(req: RegenerateRequest):
+    messages = to_chat_messages(req.character, req.history, req.message)
+    choices = []
+    try:
+        choices = await xai_chat(messages, req.count)
+    except Exception:
+        try:
+            choices = await openai_chat(messages, req.count)
+        except Exception as e:
+            raise HTTPException(status_code=502, detail=str(e))
+    return {"choices": choices}
+
+
+@app.post("/continue")
+async def continue_plot(req: ContinueRequest):
+    messages = to_chat_messages(req.character, req.history)
+    messages.append(
+        {
+            "role": "user",
+            "content": "[System Note: Continue the story naturally in character]",
+        }
+    )
+    try:
+        answers = await xai_chat(messages, 1)
+        if answers:
+            return {"text": answers[0]}
+    except Exception:
+        pass
+    try:
+        answers = await openai_chat(messages, 1)
+        if answers:
+            return {"text": answers[0]}
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=str(e))
+    return {"text": ""}
+
+
+@app.post("/generate-character")
+async def generate_character(req: GenerateCharacterRequest):
+    prompt = f"Create a unique AI character profile based on this idea: {req.idea}. Return ONLY valid JSON with keys: name, description, personality, greeting, story."
+    messages = [
+        {"role": "system", "content": "You output strictly valid JSON format."},
+        {"role": "user", "content": prompt},
+    ]
+    try:
+        res = await xai_chat(messages, 1)
+        return safe_json(res[0])
+    except Exception:
+        try:
+            res = await openai_chat(messages, 1)
+            return safe_json(res[0])
+        except Exception as e:
+            raise HTTPException(status_code=502, detail=str(e))
+
+
+@app.post("/generate-image")
+async def generate_image(req: GenerateImageRequest):
+    return {"image_base64": ""}
+
+
+@app.post("/memory")
+async def summarize_memory(req: MemoryRequest):
+    messages = to_chat_messages(req.character, req.history)
+    messages.append(
+        {
+            "role": "user",
+            "content": "Summarize key long-term facts and memories from our conversation into bullet points.",
+        }
+    )
+    try:
+        res = await xai_chat(messages, 1)
+        return {"memory": res[0]}
+    except Exception:
+        try:
+            res = await openai_chat(messages, 1)
+            return {"memory": res[0]}
+        except Exception as e:
+            raise HTTPException(status_code=502, detail=str(e))
+
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("server:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
+
+    uvicorn.run(
+        "server:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000"))
+    )
